@@ -9,6 +9,7 @@
 // it, a stop signal can race with process startup) -- the wrappers don't
 // hide that reasoning from you, only the raw libc calls.
 
+use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execvp, fork, ForkResult, Pid};
@@ -19,22 +20,37 @@ use std::time::Instant;
 /// consumes no CPU until the scheduler explicitly resumes it.
 /// Returns the child's PID.
 ///
-/// Note the inherent race: SIGSTOP is sent from the parent right after
-/// fork, but the child may not have reached `execvp` yet. Think through
-/// whether that matters for this assignment's correctness requirements,
-/// and be ready to explain your reasoning either way.
+/// Race fix: the original version sent SIGSTOP from the parent after fork.
+/// Nothing guarantees the parent runs before the child, so under load the
+/// child could get through execvp and start the real workload before the
+/// stop landed, consuming CPU no scheduling decision accounted for. Waiting
+/// for the stop in the parent doesn't help -- it only confirms the child
+/// stopped *eventually*, not *before exec*. Instead the child stops itself
+/// before exec, so it cannot reach the workload until it is SIGCONTed.
+/// The parent then waits (WUNTRACED) for that stop: otherwise a SIGCONT
+/// sent before the child reached raise() would be lost and the child would
+/// stay stopped forever.
 pub fn spawn_paused(workload_path: &str, ticks: u64) -> Pid {
+    // Build exec arguments before forking so the child does no allocation.
+    let prog = CString::new(workload_path).unwrap();
+    let args = [prog.clone(), CString::new(ticks.to_string()).unwrap()];
     match unsafe { fork() }.expect("fork failed") {
         ForkResult::Parent { child } => {
-            kill(child, Signal::SIGSTOP).expect("failed to stop child");
+            loop {
+                match waitpid(child, Some(WaitPidFlag::WUNTRACED)) {
+                    Ok(WaitStatus::Stopped(_, Signal::SIGSTOP)) => break,
+                    Err(Errno::EINTR) => continue,
+                    other => panic!("child {child} did not stop before exec: {other:?}"),
+                }
+            }
             child
         }
         ForkResult::Child => {
-            let prog = CString::new(workload_path).unwrap();
-            let arg0 = prog.clone();
-            let arg1 = CString::new(ticks.to_string()).unwrap();
-            execvp(&prog, &[arg0, arg1]).expect("execvp failed");
-            unreachable!("execvp does not return on success");
+            unsafe { libc::raise(libc::SIGSTOP) };
+            // Only reached after the scheduler resumes us.
+            let _ = execvp(&prog, &args);
+            // exec failed: exit without running the parent's atexit handlers.
+            unsafe { libc::_exit(127) };
         }
     }
 }
@@ -60,19 +76,35 @@ pub fn try_reap(pid: Pid) -> bool {
     )
 }
 
-/// Forcibly terminate a child (SIGKILL). Used during cleanup for any
-/// process still alive when the run ends -- e.g. one that "did not
-/// finish" within runfor. Never leave a real process running or stopped
-/// after your scheduler exits.
+/// Forcibly terminate a child (SIGKILL) and reap it. Used during cleanup
+/// for any process still alive when the run ends -- e.g. one that "did not
+/// finish" within runfor. SIGKILL alone only makes the child a zombie; it
+/// stays in the process table until we collect its status, so we reap it
+/// here. (SIGKILL takes effect even on a SIGSTOPped process.)
 pub fn terminate(pid: Pid) {
     let _ = kill(pid, Signal::SIGKILL);
+    reap_blocking(pid);
 }
 
 /// Blocking reap -- waits for the given child to actually exit. Used
 /// during cleanup, and to confirm a selected process's completion before
 /// you log it as finished.
+///
+/// A blocking waitpid can fail with EINTR if a signal arrives while it
+/// waits; that means "nothing collected yet", not "child exited", so we
+/// retry until we really have its exit (or death-by-signal) status.
 pub fn reap_blocking(pid: Pid) {
-    let _ = waitpid(pid, None);
+    loop {
+        match waitpid(pid, None) {
+            Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) => return,
+            Err(Errno::EINTR) => continue,
+            // Already reaped / not our child: nothing left to collect.
+            Err(Errno::ECHILD) => return,
+            // Any other status (e.g. stopped/continued) isn't an exit.
+            Ok(_) => continue,
+            Err(e) => panic!("waitpid({pid}) failed: {e}"),
+        }
+    }
 }
 
 /// Milliseconds elapsed since a fixed reference point you establish at

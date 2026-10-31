@@ -134,7 +134,16 @@ fn fcfs(
     _config: &Config,
     _rr_elapsed: &mut u64,
 ) -> Option<usize> {
-    // YOUR IMPLEMENTATION GOES HERE
+    // Non-preemptive: the running process keeps the CPU until it finishes.
+    Some(ci)
+}
+
+/// Preempt the running process `ci`: SIGSTOP it and put it back on the
+/// ready queue. Returning `None` from a policy afterwards lets step 4 of
+/// the tick loop pick the next process to run.
+fn preempt_current(ci: usize, queue: &mut Vec<usize>, procs: &[RuntimeProc]) {
+    preempt(procs[ci].pid.unwrap());
+    queue.push(ci);
 }
 
 fn sjf(
@@ -144,7 +153,18 @@ fn sjf(
     _config: &Config,
     _rr_elapsed: &mut u64,
 ) -> Option<usize> {
-    // YOUR IMPLEMENTATION GOES HERE
+    // Preempt only if some ready process has *strictly* less remaining
+    // time; on a tie the running process keeps the CPU (avoids needless
+    // context switches). Step 4 then sorts the queue and picks the shortest.
+    let shorter_waiting = queue
+        .iter()
+        .any(|&i| procs[i].remaining < procs[ci].remaining);
+    if shorter_waiting {
+        preempt_current(ci, queue, procs);
+        None
+    } else {
+        Some(ci)
+    }
 }
 
 fn rr(
@@ -154,7 +174,22 @@ fn rr(
     config: &Config,
     rr_elapsed: &mut u64,
 ) -> Option<usize> {
-    // YOUR IMPLEMENTATION GOES HERE
+    // parse_input guarantees a quantum is present when use is rr.
+    let quantum = config.quantum.unwrap();
+    if *rr_elapsed < quantum {
+        return Some(ci);
+    }
+    if queue.is_empty() {
+        // Quantum expired but nobody is waiting: keep running and start a
+        // fresh quantum rather than stopping and immediately resuming.
+        *rr_elapsed = 0;
+        return Some(ci);
+    }
+    // Quantum expired with others waiting: go to the back of the queue
+    // (behind any processes that arrived this tick, which were queued in
+    // step 1).
+    preempt_current(ci, queue, procs);
+    None
 }
 
 fn run_scheduler(config: &Config, out: &mut File) {
@@ -259,20 +294,26 @@ fn run_scheduler(config: &Config, out: &mut File) {
         }
     }
 
+    // Let the last tick run its full length: pace to the runfor boundary so
+    // the final timestamps below are real clock reads, like every other one.
+    let target = Duration::from_millis(config.runfor * TICK_MS);
+    let elapsed = epoch.elapsed();
+    if target > elapsed {
+        thread::sleep(target - elapsed);
+    }
+
     // Final completion check for a process finishing exactly at runfor.
     if let Some(ci) = current {
         if procs[ci].remaining == 0 {
             reap_blocking(procs[ci].pid.unwrap());
             procs[ci].finished = true;
-            procs[ci].finish_tick = Some(config.runfor);
-            lines.push(format!(
-                "Time {:3} : {} finished",
-                config.runfor, procs[ci].spec.name
-            ));
+            let ft = real_tick(&epoch);
+            procs[ci].finish_tick = Some(ft);
+            lines.push(format!("Time {:3} : {} finished", ft, procs[ci].spec.name));
         }
     }
 
-    lines.push(format!("Finished at time {:3}", config.runfor));
+    lines.push(format!("Finished at time {:3}", real_tick(&epoch)));
     lines.push(String::new());
 
     for p in &procs {
@@ -301,6 +342,7 @@ fn run_scheduler(config: &Config, out: &mut File) {
     }
 
     // Cleanup: kill off anything that didn't finish within runfor.
+    // terminate() also reaps, so no zombie is left in the process table.
     for p in &procs {
         if !p.finished {
             if let Some(pid) = p.pid {
